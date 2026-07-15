@@ -8,6 +8,17 @@
                    :evidence-basis ["steelworks.robotics/run-tensile-test (physics-2d simulation)"]
                    :issued-at "2026-07-15"))
 
+(defn- good-part-lot-claim
+  "A second-hop pedigree (mirrors ADR-2607999960's isic-2930 part-lot
+  pedigree shape) that embeds `upstream` (typically `good-claim`'s
+  steel-heat pedigree) via `:upstream`."
+  [upstream]
+  (pedigree/claim "PEDIGREE-lot-1" "lot-1" "cloud-itonami-isic-2930"
+                   {:proof-load-force-n 4500.0}
+                   :evidence-basis ["autoparts.robotics/run-pull-test (physics-2d simulation)"]
+                   :issued-at "2026-07-15"
+                   :upstream upstream))
+
 (deftest claim-construction-test
   (testing "a well-formed claim builds the full record"
     (let [p (good-claim)]
@@ -65,3 +76,49 @@
     (is (nil? (pedigree/claim-value (good-claim) :not-a-claim))))
   (testing "non-map pedigree is nil, never an exception"
     (is (nil? (pedigree/claim-value "not-a-pedigree" :x)))))
+
+;; ---------------------------------------------------------------------------
+;; :pedigree/upstream (ADR-2607999960's optional multi-hop chaining field)
+;; ---------------------------------------------------------------------------
+
+(deftest upstream-omitted-is-backward-compatible-test
+  (testing "omitting :upstream never sets :pedigree/upstream at all -- not even nil"
+    (let [p (good-claim)]
+      (is (not (contains? p :pedigree/upstream)))
+      (is (true? (pedigree/valid? p)))))
+  (testing "explicitly passing :upstream nil has the SAME effect as omitting it"
+    (let [p (pedigree/claim "P1" "lot-1" "actor-1" {:x 1.0}
+                             :evidence-basis ["source"] :issued-at "2026-07-15"
+                             :upstream nil)]
+      (is (not (contains? p :pedigree/upstream)))
+      (is (true? (pedigree/valid? p))))))
+
+(deftest upstream-chaining-test
+  (testing "a pedigree built WITH a valid :upstream embeds it verbatim and is itself valid"
+    (let [steel (good-claim)
+          part (good-part-lot-claim steel)]
+      (is (true? (pedigree/valid? steel)))
+      (is (= steel (:pedigree/upstream part)))
+      (is (true? (pedigree/valid? part)))
+      (testing "each hop's own claims stay independently readable"
+        (is (= 5000.0 (pedigree/claim-value (:pedigree/upstream part) :tensile-test-load-n)))
+        (is (= 4500.0 (pedigree/claim-value part :proof-load-force-n))))))
+  (testing "chains of depth > 2 validate recursively (N-hop, not just 2-hop, for free)"
+    (let [heat (good-claim)
+          part (good-part-lot-claim heat)
+          vehicle (pedigree/claim "PEDIGREE-vehicle-1" "vehicle-1" "cloud-itonami-isic-2910"
+                                   {:proof-load-force-n 4500.0}
+                                   :evidence-basis ["automotive.governor/independently re-verified upstream part pedigree"]
+                                   :issued-at "2026-07-15"
+                                   :upstream part)]
+      (is (true? (pedigree/valid? vehicle)))
+      (is (= heat (get-in vehicle [:pedigree/upstream :pedigree/upstream]))))))
+
+(deftest upstream-invalid-shape-poisons-the-whole-chain-test
+  (testing "an :upstream that fails valid? on its OWN shape makes the outer pedigree invalid too -- never trust a malformed embedded claim"
+    (let [bad-steel (assoc (good-claim) :pedigree/claims {:tensile-test-load-n "5000"})
+          part (good-part-lot-claim bad-steel)]
+      (is (false? (pedigree/valid? bad-steel)) "sanity: the embedded upstream really is shape-invalid on its own")
+      (is (false? (pedigree/valid? part)))))
+  (testing "a non-map :upstream (e.g. a bare id string, never accepted as a genuine embedded pedigree) is also invalid"
+    (is (false? (pedigree/valid? (assoc (good-claim) :pedigree/upstream "heat-1"))))))

@@ -34,7 +34,8 @@
      :pedigree/issuing-actor  \"cloud-itonami-isic-2410\" ; business-id of the issuing actor
      :pedigree/claims         {:tensile-test-load-n 5000.0} ; verified, NUMERIC claims only -- never a self-reported string
      :pedigree/evidence-basis [\"steelworks.robotics/run-tensile-test ...\"] ; non-empty vector of source citations
-     :pedigree/issued-at      \"2026-07-15\"}       ; ISO date string
+     :pedigree/issued-at      \"2026-07-15\"       ; ISO date string
+     :pedigree/upstream       nil}                 ; OPTIONAL, see below
 
   This library does not know what any particular claim key means
   (e.g. whether `:tensile-test-load-n` clears some acceptance floor)
@@ -44,6 +45,24 @@
   that judgment is the caller's `allowed-safety-classes` argument).
   This library only guarantees the record's SHAPE is honest: required
   fields present, claims numeric, evidence non-empty.
+
+  `:pedigree/upstream` (ADR-2607999960, the second applied link of
+  this pattern -- isic-2930 autoparts issuing its OWN pedigree for a
+  part-lot that in turn cites an isic-2410 steel-heat pedigree) is an
+  OPTIONAL nested `pedigree` record: when a downstream actor's own
+  export builds a pedigree for a lot that itself already carries an
+  upstream pedigree, it may embed that upstream record here, turning
+  a single hop into a genuine multi-hop provenance chain (steel heat
+  -> part lot -> ... ) representable as plain, recursively-shaped
+  EDN -- never a second network fetch, never a bare id the receiver
+  has to go look up. This field is deliberately NOT a new top-level
+  concept: it is just another `pedigree` record, so `valid?` below
+  validates it with the exact same rule, recursively, and a chain of
+  any depth is 'shaped' by applying `claim`/`valid?` once per hop.
+  Existing single-hop pedigrees (e.g. every isic-2410-issued heat
+  pedigree from the ADR-2607999950 pilot) never set this key and
+  remain fully valid with no upstream -- this extension is strictly
+  additive and backward compatible.
 
   No network, no I/O. Portable `.cljc` across JVM / ClojureScript /
   SCI / GraalVM, structurally modeled on `kotoba-lang/robotics`.")
@@ -61,6 +80,13 @@
   source citations) and `:issued-at` (an ISO date string) are supplied
   by the caller -- this fn takes no wall-clock reading itself, keeping
   it pure/deterministic like every other constructor in this fleet.
+  `:upstream` (OPTIONAL, ADR-2607999960) is another `pedigree` record
+  (or nil) this one cites as ITS OWN upstream provenance -- e.g. an
+  isic-2930 part-lot pedigree embedding the isic-2410 steel-heat
+  pedigree it was built from. Omitted/nil `:upstream` means no
+  `:pedigree/upstream` key is set at all (not even `nil`), so a
+  single-hop pedigree's shape is byte-for-byte identical to what this
+  fn produced before this option existed.
 
   Returns nil (never a partially-built record) when `id`/
   `subject-lot-id`/`issuing-actor` are not non-empty strings or
@@ -68,17 +94,18 @@
   minimal-membership-check-then-build shape. This is a SHALLOW
   presence check only; use `valid?` for the full shape/type
   validation a downstream governor needs before trusting the record."
-  [id subject-lot-id issuing-actor claims & {:keys [evidence-basis issued-at]}]
+  [id subject-lot-id issuing-actor claims & {:keys [evidence-basis issued-at upstream]}]
   (when (and (string? id) (seq id)
              (string? subject-lot-id) (seq subject-lot-id)
              (string? issuing-actor) (seq issuing-actor)
              (map? claims))
-    {:pedigree/id             id
-     :pedigree/subject-lot-id subject-lot-id
-     :pedigree/issuing-actor  issuing-actor
-     :pedigree/claims         claims
-     :pedigree/evidence-basis (vec evidence-basis)
-     :pedigree/issued-at      issued-at}))
+    (cond-> {:pedigree/id             id
+             :pedigree/subject-lot-id subject-lot-id
+             :pedigree/issuing-actor  issuing-actor
+             :pedigree/claims         claims
+             :pedigree/evidence-basis (vec evidence-basis)
+             :pedigree/issued-at      issued-at}
+      (some? upstream) (assoc :pedigree/upstream upstream))))
 
 ;; ---------------------------------------------------------------------------
 ;; Validation -- what a downstream governor independently re-checks
@@ -97,6 +124,13 @@
       numbers (never a self-reported string, keyword, or nil)
     - `:pedigree/evidence-basis` is a non-empty vector of strings
     - `:pedigree/issued-at` is a non-empty string
+    - `:pedigree/upstream` (ADR-2607999960), when the key is PRESENT
+      and non-nil, is itself a valid `pedigree` record -- checked
+      recursively via this SAME fn, so a chain of any depth is only
+      as trustworthy as every link in it. When the key is absent (the
+      single-hop case every pre-ADR-2607999960 pedigree still uses)
+      this condition is vacuously true -- never a reason to reject a
+      pedigree that never claimed to have an upstream.
 
   Non-map input (or any other shape mismatch) is simply false, never
   an exception -- a downstream governor must be able to call this on
@@ -114,7 +148,9 @@
         (seq (:pedigree/evidence-basis p))
         (every? string? (:pedigree/evidence-basis p))
         (string? (:pedigree/issued-at p))
-        (seq (:pedigree/issued-at p)))))
+        (seq (:pedigree/issued-at p))
+        (let [up (:pedigree/upstream p)]
+          (or (nil? up) (valid? up))))))
 
 (defn claim-value
   "Read one claim value off a pedigree's `:pedigree/claims` map, or nil
